@@ -33,6 +33,11 @@ if __name__ == "__main__":
     start_position = np.array([-0.01779206, -0.76012354,  0.01978261, -2.34205014, 0.02984053, 1.54119353+pi/2, 0.75344866])
     arm.safe_move_to_position(start_position) # on your mark!
 
+    # Scan position: rotate right (joint 1) and tilt wrist down (joint 6) from start pose
+    # Joint 1: -0.3 (rotate right)
+    # Joint 6: negative offset to look down
+    scan_position = np.array([-0.3, -0.76012354, 0.01978261, -2.34205014, 0.02984053, 1.54119353+pi/2 - 1.05, 0.75344866])
+
     # We need to create a counter to record the desired placing height
     num_stacked = 0
 
@@ -57,8 +62,17 @@ if __name__ == "__main__":
     while True:
         print(f"Current stacked blocks: {num_stacked}")
 
+        # Move to scan position before detecting
+        arm.safe_move_to_position(scan_position)
+        q_in = scan_position
+
         # get the transform from camera to panda_end_effector
         H_ee_camera = detector.get_H_ee_camera()
+        print(f"DEBUG H_ee_camera: {H_ee_camera}")
+
+        # Get detections and debug
+        detections = detector.get_detections()
+        print(f"DEBUG detections: {detections}")
 
         # $$T^{base}_{block} = T^{base}_{ee} \cdot T^{ee}_{camera} \cdot T^{camera}_{block}$$
         # First get T^world_ee
