@@ -156,7 +156,23 @@ if __name__ == "__main__":
 
                     # 3. Close the gripper
                     arm.exec_gripper_cmd(0.03, 50)
-                
+                    
+                    # Verify grasp success
+                    rospy.sleep(0.5)  # waiting for gripper to fully settle
+                    gripper_state = arm.get_gripper_state()
+                    gripper_width = gripper_state['position'][0] + gripper_state['position'][1]
+                    gripper_force = gripper_state['force'][0] + gripper_state['force'][1]
+
+                    # Block (5cm) should stop gripper above target (3cm)
+                    # Success: width > 0.04m (block stopped it) OR force detected (squeezing something)
+                    if gripper_width < 0.04 and gripper_force < 5.0: # will need to tune these based on tests
+                        print(f"Grasp FAILED - no block (width: {gripper_width:.3f}m, force: {gripper_force:.1f}N)")
+                        arm.exec_gripper_cmd(0.080)  # Re-open
+                        arm.safe_move_to_position(q_pre_target)
+                        continue  # move on to next block (or maybe try again a certain # of times?)
+
+                    print(f"Grasp SUCCESS (width: {gripper_width:.3f}m, force: {gripper_force:.1f}N)")
+
                     # 4. Move back to pre-grasp position
                     print("Return to pre-grasp gesture")
                     arm.safe_move_to_position(q_pre_target)
