@@ -127,6 +127,9 @@ if __name__ == "__main__":
 
         # 2. Pre-grasp
         if target_block_pose is not None:
+            # Overwrite Z to table height (0.20m) + half block (0.025m) = 0.225m
+            target_block_pose[2, 3] = 0.225
+            
             # the gesture of ee should be vertically up
             # build the transformation matrix, note: all transformation matrix takes base frame as reference coordinate 
             T_pre_grasp = np.identity(4)
