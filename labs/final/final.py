@@ -136,7 +136,6 @@ if __name__ == "__main__":
                 closest_distance = dist
                 target_block_name = name
                 target_block_pose = pose
-        
         print(f"The nearest block is {target_block_name}, distance: {closest_distance:.3f}m")
 
         # 2. Pre-grasp
@@ -147,8 +146,12 @@ if __name__ == "__main__":
             # the gesture of ee should be vertically up
             # build the transformation matrix, note: all transformation matrix takes base frame as reference coordinate 
             T_pre_grasp = np.identity(4)
+            # Locate the coordinate of block
             T_pre_grasp[:3, 3] = target_block_pose[:3, 3] + np.array([0, 0, 0.15]) 
             T_pre_grasp[[1, 2], [1, 2]] = -1
+            # make the rotation angle same with the initial pose
+            T_pre_grasp[:2, :2] = target_block_pose[:2, :2]
+            
 
             T_grasp = deepcopy(T_pre_grasp)
             T_grasp[:3, 3] -= np.array([0, 0, 0.15])
@@ -209,7 +212,8 @@ if __name__ == "__main__":
                     z_target = 0.200 + (num_stacked * 0.05) + 0.025
 
                     # C. Build Pre-place matrix (high-altitude approach)
-                    T_pre_place = deepcopy(T_pre_grasp) # Reuse the vertical downward posture
+                    T_pre_place = np.eye(4)  # Initialize as identity
+                    T_pre_place[[1, 2], [1, 2]] = -1
                     T_pre_place[:3, 3] = table_pos_base # Move to the table xy first
                     T_pre_place[2, 3] = z_target + 0.10 # Height = Stacking height + 10cm safety margin
 
