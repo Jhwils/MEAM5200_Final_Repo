@@ -143,21 +143,46 @@ if __name__ == "__main__":
             # Overwrite Z to table height (0.20m) + half block (0.025m) = 0.225m
             target_block_pose[2, 3] = 0.225
             
-            # the gesture of ee should be vertically up
-            # build the transformation matrix, note: all transformation matrix takes base frame as reference coordinate 
-            T_pre_grasp = np.identity(4)
-            # Locate the coordinate of block
-            T_pre_grasp[:3, 3] = target_block_pose[:3, 3] + np.array([0, 0, 0.15]) 
-            T_pre_grasp[[1, 2], [1, 2]] = -1
-            # make the rotation angle same with the initial pose
-            T_pre_grasp[:2, :2] = target_block_pose[:2, :2]
+            # 1. Calculate Yaw angle
+            theta = np.arctan2(target_block_pose[1, 0], target_block_pose[0, 0])
+
+            # 2. Construct rotation matrices
+            c, s = np.cos(theta), np.sin(theta)
+            R_z_yaw = np.array([
+                [c, -s, 0],
+                [s,  c, 0],
+                [0,  0, 1]
+            ])
+            # Rotate 180 degrees around X axis -> Z becomes -Z (pointing down), X remains (align Yaw)
+            R_x_180 = np.array([
+                [1,  0,  0],
+                [0, -1,  0],
+                [0,  0, -1]
+            ])
             
+            T_pre_grasp = np.identity(4)
+            # Matrix multiplication: first rotate Yaw, then flip Z
+            T_pre_grasp[:3, :3] = R_z_yaw @ R_x_180
+            T_pre_grasp[:3, 3] = target_block_pose[:3, 3] + np.array([0, 0, 0.15]) 
 
             T_grasp = deepcopy(T_pre_grasp)
             T_grasp[:3, 3] -= np.array([0, 0, 0.15])
 
             print("Start IK(Pre-grasp)...")
             q_pre_target, _, success_p, message_p = ik_solver.inverse(T_pre_grasp, q_in, 'J_pseudo', 0.5)
+            
+            if not success_p:
+                print("  [IK WARN] Standard IK failed. Trying 180-degree symmetry rotation...")
+                # Destruct uring around Z axis by 180 degrees
+                R_symmetry = np.array([
+                    [-1, 0, 0, 0],
+                    [ 0,-1, 0, 0],
+                    [ 0, 0, 1, 0],
+                    [ 0, 0, 0, 1]
+                ])
+                # Let the target matrix rotate 180 degrees
+                T_pre_grasp_180 = T_pre_grasp @ R_symmetry
+                q_pre_target, _, success_p, message_p = ik_solver.inverse(T_pre_grasp_180, q_in, 'J_pseudo', 0.5)
 
             if success_p == 1:
                 print("Move to pre-grasp gesture")
@@ -167,6 +192,10 @@ if __name__ == "__main__":
                 # Process of grasping block
                 # 1. Open the gripper
                 arm.exec_gripper_cmd(0.080)
+
+                _, T_actual_pre = fk_solver.forward(q_pre_target)
+                T_grasp = deepcopy(T_actual_pre)
+                T_grasp[2, 3] -= 0.15
 
                 # 2. Move to grasp position
                 q_target, _, success_g, message_g = ik_solver.inverse(T_grasp, q_pre_target, 'J_pseudo', 0.5)
