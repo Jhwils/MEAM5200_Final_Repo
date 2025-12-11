@@ -176,7 +176,7 @@ if __name__ == "__main__":
             T_grasp_orig = deepcopy(T_grasp)
 
             success_p = False
-            for rot in rotations:
+            for rot_idx, rot in enumerate(rotations):
                 for seed in seeds:
                     # Reset to original poses
                     T_pre_grasp = deepcopy(T_pre_grasp_orig) @ rot
@@ -185,7 +185,7 @@ if __name__ == "__main__":
                     q_pre_target, _, success_p, message_p = ik_solver.inverse(T_pre_grasp, seed, 'J_pseudo', 0.5)
 
                     if success_p:
-                        rot_angle = [0, 90, 180, 270][rotations.index(rot)]
+                        rot_angle = [0, 90, 180, 270][rot_idx]
                         seed_name = 'scan' if np.allclose(seed, scan_position) else ('current' if np.allclose(seed, q_in) else 'start')
                         print(f"  IK succeeded with seed={seed_name}, rot={rot_angle}°")
                         break
