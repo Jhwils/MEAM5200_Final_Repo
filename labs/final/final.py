@@ -30,6 +30,13 @@ if __name__ == "__main__":
     arm = ArmController()
     detector = ObjectDetector()
 
+    OFFSET_X = 0.00  
+    OFFSET_Y = 0.00
+    
+    # Extra correction for placing (if the stacked tower is leaning, the place position might need adjustment)
+    PLACE_OFFSET_X = 0.00
+    PLACE_OFFSET_Y = 0.00
+
     start_position = np.array([-0.01779206, -0.76012354,  0.01978261, -2.34205014, 0.02984053, 1.54119353+pi/2, 0.75344866])
     arm.safe_move_to_position(start_position) # on your mark!
 
@@ -106,186 +113,373 @@ if __name__ == "__main__":
     while len(static_blocks_to_pick) > 0:
         print(f"Current stacked blocks: {num_stacked}")
 
-        # Sort blocks by |Y| to pick inner blocks first (closer to origin)
-        # This prevents gripper from hitting outer blocks when reaching inward
         static_blocks_to_pick.sort(key=lambda x: abs(x[1][1, 3]))
-
-        # Pop the innermost block (smallest |Y|)
         target_block_name, target_block_pose = static_blocks_to_pick.pop(0)
-        print(f"Picking {target_block_name}, Y: {target_block_pose[1,3]:.3f}m")
+        print(f"Picking {target_block_name}...")
 
-        # 2. Pre-grasp
-        if target_block_pose is not None:
-            # Overwrite Z to table height (0.20m) + half block (0.025m) = 0.225m
-            target_block_pose[2, 3] = 0.225
+        # ---------------------------------------------------------
+        # 1. Move to Coarse Pre-grasp (High Altitude)
+        # ---------------------------------------------------------
+        target_block_pose[2, 3] = 0.225
+        target_block_pose[0, 3] += OFFSET_X
+        target_block_pose[1, 3] += OFFSET_Y
 
-            # 1. Calculate Yaw angle from block orientation
-            theta = np.arctan2(target_block_pose[1, 0], target_block_pose[0, 0])
-            print(f"  Block yaw: {np.degrees(theta):.1f}°")
+        theta = np.arctan2(target_block_pose[1, 0], target_block_pose[0, 0])
+        c, s = np.cos(theta), np.sin(theta)
+        R_z_yaw = np.array([[c, -s, 0], [s,  c, 0], [0,  0, 1]])
+        R_x_180 = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
 
-            # 2. Construct rotation matrices
-            c, s = np.cos(theta), np.sin(theta)
-            R_z_yaw = np.array([
-                [c, -s, 0],
-                [s,  c, 0],
-                [0,  0, 1]
-            ])
-            # Rotate 180 degrees around X axis -> Z becomes -Z (pointing down), X remains (align Yaw)
-            R_x_180 = np.array([
-                [1,  0,  0],
-                [0, -1,  0],
-                [0,  0, -1]
-            ])
+        T_pre_grasp = np.identity(4)
+        T_pre_grasp[:3, :3] = R_z_yaw @ R_x_180
+        T_pre_grasp[:3, 3] = target_block_pose[:3, 3] + np.array([0, 0, 0.10]) # +10cm
 
-            T_pre_grasp = np.identity(4)
-            # Matrix multiplication: first rotate Yaw, then flip Z
-            T_pre_grasp[:3, :3] = R_z_yaw @ R_x_180
-            T_pre_grasp[:3, 3] = target_block_pose[:3, 3] + np.array([0, 0, 0.08])  # 8cm above block
+        print(f"Moving to Coarse Pre-grasp...")
+        q_pre_target, _, success_p, _ = ik_solver.inverse(T_pre_grasp, q_in, 'J_pseudo', 0.5)
+        
+        if not success_p:
+            R_sym = np.array([[-1,0,0,0],[0,-1,0,0],[0,0,1,0],[0,0,0,1]])
+            q_pre_target, _, success_p, _ = ik_solver.inverse(T_pre_grasp @ R_sym, q_in, 'J_pseudo', 0.5)
 
-            T_grasp = deepcopy(T_pre_grasp)
-            T_grasp[:3, 3] -= np.array([0, 0, 0.08])
+        if not success_p:
+            print("Pre-grasp IK failed. Skipping block.")
+            continue
 
-            print("Start IK(Pre-grasp)...")
+        arm.exec_gripper_cmd(0.080)
+        arm.safe_move_to_position(q_pre_target)
+        q_in = q_pre_target
+        
+        print("  Visual Servoing...")
+        rospy.sleep(0.5) # Wait for settle
+        
+        H_ee_camera = detector.get_H_ee_camera()
+        _, T_base_ee = fk_solver.forward(q_in)
+        detections = detector.get_detections()
+        
+        refined_pose = None
+        min_dist = 100.0
+        expected_pos = target_block_pose[:3, 3]
 
-            # Try multiple IK strategies for robustness
-            # Rotation matrices for symmetry (cube is symmetric, so 90° rotations are equivalent)
-            R_0 = np.eye(4)  # No rotation
-            R_90 = np.array([
-                [0, 1, 0, 0],
-                [-1, 0, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1]
-            ])
-            R_180 = np.array([
-                [-1, 0, 0, 0],
-                [0, -1, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1]
-            ])
-            R_270 = np.array([
-                [0, -1, 0, 0],
-                [1, 0, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1]
-            ])
+        for (name, pose) in detections:
+            H_world_new = T_base_ee @ H_ee_camera @ pose
+            dist = np.linalg.norm(H_world_new[:3, 3] - expected_pos)
+            if dist < 0.10: 
+                if dist < min_dist:
+                    min_dist = dist
+                    refined_pose = H_world_new
+        
+        if refined_pose is not None:
+            print(f"  Correction: {np.linalg.norm(refined_pose[:3,3] - expected_pos)*1000:.1f} mm")
+            
+            target_pos_final = refined_pose[:3, 3]
+            target_pos_final[2] = 0.225
+            target_pos_final[0] += OFFSET_X
+            target_pos_final[1] += OFFSET_Y
 
-            rotations = [R_0, R_90, R_180, R_270]
-            seeds = [q_in, scan_position, start_position]
+            theta_refined = np.arctan2(refined_pose[1, 0], refined_pose[0, 0])
+            c, s = np.cos(theta_refined), np.sin(theta_refined)
+            R_z_yaw = np.array([[c, -s, 0], [s,  c, 0], [0,  0, 1]])
+            
+            # Instead of diving diagonally, we first ALIGN horizontally
+            
+            # 1. Define Refined Pre-grasp (High Z)
+            T_pre_grasp_refined = np.identity(4)
+            T_pre_grasp_refined[:3, :3] = R_z_yaw @ R_x_180
+            T_pre_grasp_refined[:3, 3] = target_pos_final + np.array([0, 0, 0.10]) # High
+            
+            # 2. Define Refined Grasp (Low Z)
+            T_grasp_final = deepcopy(T_pre_grasp_refined)
+            T_grasp_final[:3, 3] -= np.array([0, 0, 0.10]) # Low
 
-            T_pre_grasp_orig = deepcopy(T_pre_grasp)
-            T_grasp_orig = deepcopy(T_grasp)
+            # 3. Move to Refined Pre-grasp (The Shimmy)
+            # This ensures we are perfectly above the block before descending
+            q_pre_refined, _, success_ref, _ = ik_solver.inverse(T_pre_grasp_refined, q_in, 'J_pseudo', 0.5)
+            
+            if success_ref:
+                arm.safe_move_to_position(q_pre_refined)
+                q_in = q_pre_refined
+            else:
+                # Try symmetry
+                R_sym = np.array([[-1,0,0,0],[0,-1,0,0],[0,0,1,0],[0,0,0,1]])
+                q_pre_refined, _, success_ref, _ = ik_solver.inverse(T_pre_grasp_refined @ R_sym, q_in, 'J_pseudo', 0.5)
+                if success_ref:
+                    arm.safe_move_to_position(q_pre_refined)
+                    q_in = q_pre_refined
+                    # Update grasp matrix to match symmetry
+                    T_grasp_final = T_grasp_final @ R_sym
+            
+        else:
+            print("  [WARN] Block lost. Using coarse estimation.")
+            T_grasp_final = deepcopy(T_pre_grasp)
+            T_grasp_final[:3, 3] -= np.array([0, 0, 0.10])
+            T_grasp_final[2, 3] = 0.225
 
-            success_p = False
-            for rot_idx, rot in enumerate(rotations):
-                for seed in seeds:
-                    # Reset to original poses
-                    T_pre_grasp = deepcopy(T_pre_grasp_orig) @ rot
-                    T_grasp = deepcopy(T_grasp_orig) @ rot
+        # Execute Vertical Descent
+        print("  Descending to Grasp...")
+        q_grasp, _, success_g, _ = ik_solver.inverse(T_grasp_final, q_in, 'J_pseudo', 0.5)
+        
+        if success_g:
+            arm.safe_move_to_position(q_grasp)
+            arm.exec_gripper_cmd(0.03, 50)
+            
+            # Place Logic
+            if team == 'red':
+                table_pos_base = np.array([0.562, 0.075, 0.200])
+            else:
+                table_pos_base = np.array([0.562, -0.075, 0.200])
 
-                    q_pre_target, _, success_p, message_p = ik_solver.inverse(T_pre_grasp, seed, 'J_pseudo', 0.5)
+            table_pos_base[0] += PLACE_OFFSET_X
+            table_pos_base[1] += PLACE_OFFSET_Y
 
-                    if success_p:
-                        rot_angle = [0, 90, 180, 270][rot_idx]
-                        seed_name = 'scan' if np.allclose(seed, scan_position) else ('current' if np.allclose(seed, q_in) else 'start')
-                        print(f"  IK succeeded with seed={seed_name}, rot={rot_angle}°")
-                        break
-                if success_p:
-                    break
+            z_target = 0.200 + (num_stacked * 0.05) + 0.025
 
-            if not success_p:
-                print(f"  [IK FAIL] All pre-grasp attempts failed: {message_p}")
-                print("  Skipping this block...")
-                continue
+            T_pre_place = np.eye(4)
+            T_pre_place[[1, 2], [1, 2]] = -1
+            T_pre_place[:3, 3] = table_pos_base
+            T_pre_place[2, 3] = z_target + 0.06
 
-            if success_p == 1:
-                print("Move to pre-grasp gesture")
-                # 1. Open the gripper
-                arm.exec_gripper_cmd(0.080)
-                arm.safe_move_to_position(q_pre_target)
-                q_in = q_pre_target # Update seed
+            T_place = deepcopy(T_pre_place)
+            T_place[2, 3] = z_target + 0.005
+            
+            print(f"--> Placing on Stack {num_stacked}...")
+            q_pre_place, _, success_rp, _ = ik_solver.inverse(T_pre_place, q_in, 'J_pseudo', 0.5)
 
-                # 2. Move to grasp position (straight down from pre-grasp)
-                # T_grasp already has the correct rotation from pre-grasp IK attempt
-                # Try multiple seeds
-                grasp_seeds = [q_pre_target, q_in, scan_position]
-                success_g = False
-
-                for g_seed in grasp_seeds:
-                    q_target, _, success_g, message_g = ik_solver.inverse(T_grasp, g_seed, 'J_pseudo', 0.5)
-                    if success_g:
-                        break
-
-                # If still failing, try other 90° rotations
-                if not success_g:
-                    print("  [IK WARN] Grasp IK failed. Trying other rotations...")
-                    for rot in rotations:
-                        T_grasp_try = deepcopy(T_grasp_orig) @ rot
-                        for g_seed in grasp_seeds:
-                            q_target, _, success_g, message_g = ik_solver.inverse(T_grasp_try, g_seed, 'J_pseudo', 0.5)
-                            if success_g:
-                                break
-                        if success_g:
-                            break
-
-                if success_g == 1:
-                    print("Start IK(Grasp)...")
-                    arm.safe_move_to_position(q_target)
-
-                    # 3. Close the gripper
-                    arm.exec_gripper_cmd(0.03, 50)
-
-                    # Move the block to desired location
-                    # Place on goal platform edge closest to static blocks
-                    if team == 'red':
-                        table_pos_base = np.array([0.562, 0.075, 0.200])
-                    else:
-                        table_pos_base = np.array([0.562, -0.075, 0.200])
-
-                    # Calculate target z height
-                    z_target = 0.200 + (num_stacked * 0.05) + 0.025
-
-                    # Build Pre-place matrix (high-altitude approach)
-                    T_pre_place = np.eye(4)
-                    T_pre_place[[1, 2], [1, 2]] = -1
-                    T_pre_place[:3, 3] = table_pos_base
-                    T_pre_place[2, 3] = z_target + 0.06
-
-                    # Build Place matrix (release point)
-                    T_place = deepcopy(T_pre_place)
-                    T_place[2, 3] = z_target + 0.005
-
-                    print(f"--> Moving to Table (Stack {num_stacked})...")
-                    q_pre_place, _, success_rp, _ = ik_solver.inverse(T_pre_place, q_in, 'J_pseudo', 0.5)
-
-                    if success_rp:
-                        # 1. High-altitude approach
-                        arm.safe_move_to_position(q_pre_place)
-                        q_in = q_pre_place
-
-                        # 2. Vertical descent
-                        q_place, _, success_r, _ = ik_solver.inverse(T_place, q_in, 'J_pseudo', 0.5)
-                        if success_r:
-                            arm.safe_move_to_position(q_place)
-                            q_in = q_place
-
-                            # 3. Release block
-                            arm.exec_gripper_cmd(0.080)
-
-                            # 4. Retreat (return to high altitude)
-                            arm.safe_move_to_position(q_pre_place)
-                            q_in = q_pre_place
-
-                            print(f"Block {num_stacked} placed successfully!")
-                            num_stacked += 1
-                        else:
-                            print("Place Down IK Failed.")
-                    else:
-                        print("Pre-place IK Failed.")
+            if success_rp:
+                arm.safe_move_to_position(q_pre_place)
+                q_in = q_pre_place
+                q_place, _, success_r, _ = ik_solver.inverse(T_place, q_in, 'J_pseudo', 0.5)
+                if success_r:
+                    arm.safe_move_to_position(q_place)
+                    q_in = q_place
+                    arm.exec_gripper_cmd(0.080)
+                    arm.safe_move_to_position(q_pre_place)
+                    q_in = q_pre_place
+                    num_stacked += 1
+                    print("Placed!")
                 else:
-                    print(f"Grasping IK failed: {message_g}")
+                    print("Place Down failed")
+            else:
+                print("Pre-place failed")
+
+        else:
+            print("Grasp IK Failed")
 
     print(f"\n=== Static blocks done: Stacked {num_stacked} blocks ===")
 
+
+    # DYNAMIC BLOCK HANDLING (Wait-to-Intercept)
+    print("\n>>> DYNAMIC MODE (Wait-to-Intercept) <<<\n")
+
+    if team == 'red':
+        observation_position = np.array([-0.66902174, -0.80879801,  1.61876292, -1.13930242,  0.84472293,  1.31064934,  2.04106599])
+        TURNTABLE_CENTER = np.array([0.0, 0.990])
+    else:
+        observation_position = np.array([0.67380074, -0.73944342, -1.71271262, -1.14979493, -0.75195756,  1.35414952, -0.49852892])
+        TURNTABLE_CENTER = np.array([0.0, -0.990])
+
+    TURNTABLE_HEIGHT = 0.200
+    BLOCK_HALF_HEIGHT = 0.025
+
+    print("Moving to observation position...")
+    arm.safe_move_to_position(observation_position)
+    q_in = observation_position
+
+    H_ee_camera = detector.get_H_ee_camera()
+
+    MAX_DYNAMIC_GRABS = 4
+    dynamic_grabbed = 0
+    attempt = 0
+
+    while dynamic_grabbed < MAX_DYNAMIC_GRABS:
+        attempt += 1
+        print(f"\n--- Dynamic Attempt {attempt} ---")
+
+        # 1. Scan
+        _, T_base_ee = fk_solver.forward(q_in)
+        detections = detector.get_detections()
+        t_now = time_in_seconds()
+
+        target_samples = []
+        found_block = False
+
+        for (name, pose) in detections:
+            if "dynamic" in name:
+                H_world_block = T_base_ee @ H_ee_camera @ pose
+                x = H_world_block[0, 3]
+                y = H_world_block[1, 3]
+                theta_block = np.arctan2(H_world_block[1, 0], H_world_block[0, 0])
+                target_samples.append((t_now, x, y, theta_block, name))
+                found_block = True
+                break
+
+        if not found_block:
+            print("No dynamic block. Retrying...")
+            rospy.sleep(0.5)
+            continue
+
+        # 2. Tracking
+        NUM_SAMPLES = 12 
+        for i in range(NUM_SAMPLES):
+            _, T_base_ee = fk_solver.forward(q_in)
+            detections = detector.get_detections()
+            t_now = time_in_seconds()
+
+            for (name, pose) in detections:
+                if "dynamic" in name:
+                    H_world_block = T_base_ee @ H_ee_camera @ pose
+                    x = H_world_block[0, 3]
+                    y = H_world_block[1, 3]
+                    theta_block = np.arctan2(H_world_block[1, 0], H_world_block[0, 0])
+                    target_samples.append((t_now, x, y, theta_block, name))
+                    break
+            rospy.sleep(0.05)
+
+        if len(target_samples) < 5:
+            continue
+
+        # 3. Estimate Omega
+        phis = []
+        times = []
+        for (t, x, y, theta_b, name) in target_samples:
+            phi = np.arctan2(y - TURNTABLE_CENTER[1], x - TURNTABLE_CENTER[0])
+            phis.append(phi)
+            times.append(t)
+
+        phis = np.unwrap(phis)
+        times = np.array(times)
+
+        if len(times) > 1:
+            A = np.vstack([times, np.ones(len(times))]).T
+            omega, phi0 = np.linalg.lstsq(A, phis, rcond=None)[0]
+        else:
+            continue
+
+        last_sample = target_samples[-1]
+        t_last, x_last, y_last, theta_last, block_name = last_sample
+        radius = np.sqrt((x_last - TURNTABLE_CENTER[0])**2 + (y_last - TURNTABLE_CENTER[1])**2)
+
+        print(f"  Omega: {omega:.3f} rad/s")
+
+        # 4. Predict Intercept
+        INTERCEPT_DELAY = 3.0 
+        t_intercept = time_in_seconds() + INTERCEPT_DELAY
+        phi_intercept = omega * t_intercept + phi0
+        
+        if team == 'red':
+            target_phi_ideal = -pi/2
+        else:
+            target_phi_ideal = pi/2
+            
+        current_phi = omega * time_in_seconds() + phi0
+        delta_phi = target_phi_ideal - current_phi
+        while delta_phi / omega < 0:
+             if omega > 0: delta_phi += 2*pi
+             else: delta_phi -= 2*pi
+             
+        time_to_travel = delta_phi / omega
+        while time_to_travel < 2.0:
+            time_to_travel += abs(2*pi / omega)
+            
+        t_intercept = time_in_seconds() + time_to_travel
+        phi_intercept = omega * t_intercept + phi0
+        
+        x_predict = TURNTABLE_CENTER[0] + radius * np.cos(phi_intercept)
+        y_predict = TURNTABLE_CENTER[1] + radius * np.sin(phi_intercept)
+        z_predict = TURNTABLE_HEIGHT + BLOCK_HALF_HEIGHT
+        
+        print(f"  Intercept in {time_to_travel:.2f}s")
+
+        # 5. Compute Pre-Grasp
+        theta_intercept = theta_last + omega * (t_intercept - t_last)
+        c, s = np.cos(theta_intercept), np.sin(theta_intercept)
+        R_z_yaw = np.array([[c, -s, 0], [s,  c, 0], [0,  0, 1]])
+        R_x_180 = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+
+        T_pre_grasp_dyn = np.identity(4)
+        T_pre_grasp_dyn[:3, :3] = R_z_yaw @ R_x_180
+        T_pre_grasp_dyn[:3, 3] = np.array([x_predict, y_predict, z_predict + 0.05])
+
+        T_grasp_dyn = deepcopy(T_pre_grasp_dyn)
+        T_grasp_dyn[2, 3] = z_predict
+
+        # 6. Move to Pre-Grasp
+        print("  Moving to Intercept Point...")
+        q_pre_dyn, _, success_p, _ = ik_solver.inverse(T_pre_grasp_dyn, q_in, 'J_pseudo', 0.5)
+        if not success_p:
+            R_sym = np.array([[-1,0,0,0],[0,-1,0,0],[0,0,1,0],[0,0,0,1]])
+            q_pre_dyn, _, success_p, _ = ik_solver.inverse(T_pre_grasp_dyn @ R_sym, q_in, 'J_pseudo', 0.5)
+
+        if not success_p:
+            print("  Unreachable. Skip.")
+            continue
+
+        arm.exec_gripper_cmd(0.080)
+        arm.safe_move_to_position(q_pre_dyn)
+        q_in = q_pre_dyn
+        
+        # 7. Wait
+        TIME_OFFSET = 0.15 
+        while time_in_seconds() < (t_intercept - TIME_OFFSET):
+            pass
+            
+        # 8. Blind Grasp
+        print("  GRAB!")
+        q_grasp_dyn, _, success_g, _ = ik_solver.inverse(T_grasp_dyn, q_in, 'J_pseudo', 0.5)
+        
+        if success_g:
+            arm.safe_move_to_position(q_grasp_dyn)
+            arm.exec_gripper_cmd(0.03, 50)
+            
+            gripper_state = arm.get_gripper_state()
+            if gripper_state['position'][0] < 0.01:
+                print("  Missed.")
+                arm.exec_gripper_cmd(0.080)
+                arm.safe_move_to_position(q_pre_dyn)
+                continue
+                
+            print("  Got it!")
+            
+            # 9. Place
+            if team == 'red':
+                table_pos_base = np.array([0.562, 0.075, 0.200])
+            else:
+                table_pos_base = np.array([0.562, -0.075, 0.200])
+
+            table_pos_base[0] += PLACE_OFFSET_X
+            table_pos_base[1] += PLACE_OFFSET_Y
+
+            z_target = 0.200 + (num_stacked * 0.05) + 0.025
+            
+            T_pre_place = np.eye(4)
+            T_pre_place[[1, 2], [1, 2]] = -1
+            T_pre_place[:3, 3] = table_pos_base
+            T_pre_place[2, 3] = z_target + 0.06
+            T_place = deepcopy(T_pre_place)
+            T_place[2, 3] = z_target + 0.005
+
+            place_seeds = [q_in, scan_position, start_position]
+            success_rp = False
+            for seed in place_seeds:
+                q_pre_place, _, success_rp, _ = ik_solver.inverse(T_pre_place, seed, 'J_pseudo', 0.5)
+                if success_rp: break
+
+            if success_rp:
+                arm.safe_move_to_position(q_pre_place)
+                q_in = q_pre_place
+                q_place, _, success_r, _ = ik_solver.inverse(T_place, q_in, 'J_pseudo', 0.5)
+                if success_r:
+                    arm.safe_move_to_position(q_place)
+                    arm.exec_gripper_cmd(0.080)
+                    arm.safe_move_to_position(q_pre_place)
+                    q_in = q_pre_place
+                    num_stacked += 1
+                    dynamic_grabbed += 1
+                    print(f"  Placed dynamic block {num_stacked}!")
+
+        arm.safe_move_to_position(observation_position)
+        q_in = observation_position
+
+    print(f"\n=== FINAL: Stacked {num_stacked} total blocks ===")
+        
     # ==================== DYNAMIC BLOCK HANDLING ====================
     print("\n>>> Switching to DYNAMIC block mode <<<\n")
 
@@ -536,6 +730,10 @@ if __name__ == "__main__":
             table_pos_base = np.array([0.562, 0.075, 0.200])
         else:
             table_pos_base = np.array([0.562, -0.075, 0.200])
+
+        # Apply the same placement offsets
+        table_pos_base[0] += PLACE_OFFSET_X
+        table_pos_base[1] += PLACE_OFFSET_Y
 
         z_target = 0.200 + (num_stacked * 0.05) + 0.025
 
